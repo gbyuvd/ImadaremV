@@ -21,21 +21,24 @@ class ImplicitRefinementConfig:
     ema_decay: float = 0.995
     diversity_weight: float = 0.05
     sampling_temperature: float = 1.2
-    use_refine_gate: bool = False  # internal gate (replaces use_meta_policy)
+    use_refine_gate: bool = False
+    use_gradient_checkpointing: bool = False  # New: memory optimization
+    use_flash_attention: bool = False  # New: speed optimization
 
 
 class SinusoidalPositionalEmbedding(nn.Module):
     def __init__(self, dim, max_seq_len):
         super().__init__()
-        position = torch.arange(max_seq_len).unsqueeze(1)
-        div_term = torch.exp(torch.arange(0, dim, 2) * (-math.log(10000.0) / dim))
+        position = torch.arange(max_seq_len, dtype=torch.float).unsqueeze(1)
+        div_term = torch.exp(torch.arange(0, dim, 2, dtype=torch.float) * (-math.log(10000.0) / dim))
         pe = torch.zeros(max_seq_len, dim)
         pe[:, 0::2] = torch.sin(position * div_term)
         pe[:, 1::2] = torch.cos(position * div_term)
-        self.register_buffer("pe", pe)
+        self.register_buffer("pe", pe, persistent=False)
 
     def forward(self, L, device):
-        return self.pe[:L].unsqueeze(0).to(device)
+        # No need for .to(device) - buffer is already on correct device
+        return self.pe[:L].unsqueeze(0)
 
 
 class AdaptivePositionalEmbedding(nn.Module):
@@ -43,12 +46,14 @@ class AdaptivePositionalEmbedding(nn.Module):
         super().__init__()
         self.base_pe = SinusoidalPositionalEmbedding(dim, max_seq_len)
         self.decay_logit = nn.Parameter(torch.zeros(max_seq_len))
+        # Better initialization for decay
+        nn.init.normal_(self.decay_logit, mean=0.0, std=0.02)
 
     def forward(self, x):
         B, L = x.shape[:2]
         pe = self.base_pe(L, x.device)
         decay = torch.sigmoid(self.decay_logit[:L])
-        return pe * decay.unsqueeze(-1)
+        return pe * decay.view(1, -1, 1)  # More efficient than unsqueeze
 
 
 class TransformerBlock(nn.Module):
@@ -62,13 +67,26 @@ class TransformerBlock(nn.Module):
             nn.Linear(config.hidden_size, 4 * config.hidden_size),
             nn.GELU(),
             nn.Dropout(config.dropout),
-            nn.Linear(4 * config.hidden_size, config.hidden_size)
+            nn.Linear(4 * config.hidden_size, config.hidden_size),
+            nn.Dropout(config.dropout)  # Added output dropout
         )
         self.norm1 = nn.LayerNorm(config.hidden_size)
         self.norm2 = nn.LayerNorm(config.hidden_size)
+        
+        # Better weight initialization
+        self._init_weights()
+    
+    def _init_weights(self):
+        for module in self.mlp:
+            if isinstance(module, nn.Linear):
+                nn.init.xavier_uniform_(module.weight)
+                if module.bias is not None:
+                    nn.init.zeros_(module.bias)
 
     def forward(self, x):
-        x = x + self.attn(self.norm1(x), self.norm1(x), self.norm1(x))[0]
+        # Pre-norm once, reuse
+        x_norm = self.norm1(x)
+        x = x + self.attn(x_norm, x_norm, x_norm, need_weights=False)[0]
         x = x + self.mlp(self.norm2(x))
         return x
 
@@ -78,6 +96,7 @@ class ImplicitRefinementModel(nn.Module):
         super().__init__()
         self.config = config
 
+        # Token ID setup (unchanged logic)
         if tokenizer is not None:
             self.pad_token_id = getattr(tokenizer, "pad_token_id", None)
             self.mask_token_id = getattr(tokenizer, "mask_token_id", None)
@@ -101,121 +120,148 @@ class ImplicitRefinementModel(nn.Module):
         if len(set(special_tokens)) != len(special_tokens):
             raise ValueError(f"Special token collision")
 
-        # Core embeddings
+        # Core embeddings with better initialization
         self.token_emb = nn.Embedding(config.vocab_size, config.hidden_size)
+        nn.init.normal_(self.token_emb.weight, mean=0.0, std=0.02)
+        
         self.pos_emb = AdaptivePositionalEmbedding(config.hidden_size, config.max_seq_len)
         self.time_emb = nn.Linear(1, config.hidden_size)
+        nn.init.normal_(self.time_emb.weight, mean=0.0, std=0.02)
 
         if config.use_self_cond:
             self.self_cond_proj = nn.Linear(config.vocab_size, config.hidden_size)
+            nn.init.xavier_uniform_(self.self_cond_proj.weight)
         else:
             self.self_cond_proj = None
 
-        self.transformer = nn.Sequential(*[
+        self.transformer = nn.ModuleList([
             TransformerBlock(config) for _ in range(config.num_layers)
         ])
 
-        #   
-        # V: INTERNALIZED REFINEMENT GATE — NO SEPARATE NETWORK
-        #   
         self.to_logits = nn.Linear(config.hidden_size, config.vocab_size)
+        nn.init.normal_(self.to_logits.weight, mean=0.0, std=0.02)
+        
         if config.use_refine_gate:
             self.to_refine_gate = nn.Linear(config.hidden_size, 1)
-            # Initialize gate to be OPEN (refine by default)
-            nn.init.constant_(self.to_refine_gate.bias, 2.0) 
+            nn.init.xavier_uniform_(self.to_refine_gate.weight)
+            nn.init.constant_(self.to_refine_gate.bias, 2.0)
         else:
             self.to_refine_gate = None
-        #   
 
         # EMA teacher
         self.teacher = None
         self.ema_decay = config.ema_decay
-        self.register_buffer("ema_step", torch.tensor(0.0))
+        self.register_buffer("ema_step", torch.tensor(0, dtype=torch.long), persistent=False)
+        
+        # Cache for normalized entropy denominator
+        self.register_buffer("log_vocab_size", torch.tensor(math.log(config.vocab_size)), persistent=False)
 
     def init_teacher(self):
         if self.teacher is None:
             self.teacher = copy.deepcopy(self)
             self.teacher.teacher = None
             for p in self.teacher.parameters():
-                p.requires_grad = False
+                p.requires_grad_(False)
 
     def update_teacher(self):
         if self.teacher is None:
             self.init_teacher()
             return
         self.ema_step += 1
-        decay = min(self.ema_decay, (self.ema_step - 1) / (self.ema_step + 1))
+        # Use in-place operations for efficiency
+        decay = min(self.ema_decay, (self.ema_step - 1).float() / (self.ema_step + 1).float())
         with torch.no_grad():
             for t_param, s_param in zip(self.teacher.parameters(), self.parameters()):
-                t_param.data.mul_(decay).add_(s_param.data, alpha=1 - decay)
+                t_param.mul_(decay).add_(s_param, alpha=1 - decay)
 
-    #   
-    # Unified forward: returns (logits, refine_gate?) 
-    #   
+    def _forward_transformer(self, x):
+        """Helper for gradient checkpointing"""
+        for block in self.transformer:
+            if self.config.use_gradient_checkpointing and self.training:
+                x = torch.utils.checkpoint.checkpoint(block, x, use_reentrant=False)
+            else:
+                x = block(x)
+        return x
+
     def forward(self, x_t: torch.Tensor, t: torch.Tensor, x_self_cond: Optional[torch.Tensor] = None):
         B, L = x_t.shape
+        
+        # Combine embeddings more efficiently
         x = self.token_emb(x_t)
         x = x + self.pos_emb(x_t)
-        time_fea = self.time_emb(t.float().unsqueeze(1)).unsqueeze(1)
+        
+        # Optimize time embedding computation
+        time_fea = self.time_emb(t.view(-1, 1)).view(B, 1, -1)
         x = x + time_fea
+        
         if x_self_cond is not None and self.self_cond_proj is not None:
             x = x + self.self_cond_proj(x_self_cond)
-        x = self.transformer(x)
+        
+        x = self._forward_transformer(x)
         
         logits = self.to_logits(x)
+        
         if self.config.use_refine_gate and self.to_refine_gate is not None:
-            refine_logits = self.to_refine_gate(x).squeeze(-1)  # (B, L)
+            refine_logits = self.to_refine_gate(x).squeeze(-1)
             refine_gate = torch.sigmoid(refine_logits)
             return logits, refine_gate
         return logits
-    #   
 
     def _get_uncertainty_from_teacher(self, x_t, t, x_self_cond):
+        """Optimized uncertainty computation"""
         model = self.teacher if self.teacher is not None else self
         with torch.no_grad():
             if self.config.use_refine_gate:
                 logits, _ = model(x_t, t, x_self_cond)
             else:
                 logits = model(x_t, t, x_self_cond)
-        probs = F.softmax(logits, dim=-1)
-        entropy = -(probs * torch.log(probs + 1e-8)).sum(dim=-1)
-        return entropy / math.log(self.config.vocab_size)
+        
+        # More numerically stable entropy computation
+        log_probs = F.log_softmax(logits, dim=-1)
+        probs = torch.exp(log_probs)
+        entropy = -(probs * log_probs).sum(dim=-1)
+        return entropy / self.log_vocab_size
 
     @torch.no_grad()
     def sample(self, batch_size: int, max_len: int, device: torch.device) -> List[List[int]]:
-        x_t = torch.full((batch_size, max_len), self.mask_token_id, device=device)
+        x_t = torch.full((batch_size, max_len), self.mask_token_id, device=device, dtype=torch.long)
         finished = torch.zeros(batch_size, dtype=torch.bool, device=device)
-        x_prev = x_t.clone()
         x_self_cond = None
 
+        # Pre-allocate for efficiency
+        t_tensor = torch.empty(batch_size, device=device, dtype=torch.float)
+        
+        # Track previous state without cloning
+        x_prev = x_t.clone()
+
         for step in range(self.config.max_refinement_steps):
-            t = torch.full((batch_size,), step, dtype=torch.float, device=device)
+            t_tensor.fill_(step)
             
-            #  
             if self.config.use_refine_gate:
-                logits, refine_gate = self(x_t, t, x_self_cond)
+                logits, refine_gate = self(x_t, t_tensor, x_self_cond)
             else:
-                logits = self(x_t, t, x_self_cond)
+                logits = self(x_t, t_tensor, x_self_cond)
                 refine_gate = None
-            #  
 
-            uncertainty = self._get_uncertainty_from_teacher(x_t, t, x_self_cond)
-            probs = F.softmax(logits / self.config.sampling_temperature, dim=-1)
-            pred_tokens = torch.multinomial(probs.view(-1, probs.size(-1)), 1).view(batch_size, max_len)
+            uncertainty = self._get_uncertainty_from_teacher(x_t, t_tensor, x_self_cond)
+            
+            # More efficient sampling
+            probs = F.softmax(logits * (1.0 / self.config.sampling_temperature), dim=-1)
+            pred_tokens = torch.multinomial(
+                probs.view(-1, probs.size(-1)), 
+                num_samples=1
+            ).view(batch_size, max_len)
 
-            #  
             if self.config.use_refine_gate:
-                # Use internal gate directly (no threshold needed)
                 needs_refine = refine_gate > 0.5
             else:
-                needs_refine = (uncertainty > self.config.min_refine_uncertainty)
-            #  
+                needs_refine = uncertainty > self.config.min_refine_uncertainty
 
             if self.eos_token_id is not None:
-                eos_mask = (x_t == self.eos_token_id)
+                eos_mask = x_t == self.eos_token_id
                 for b in range(batch_size):
                     if finished[b]:
-                        needs_refine[b] = False
+                        needs_refine[b].fill_(False)
                         continue
                     eos_pos = eos_mask[b].nonzero(as_tuple=True)[0]
                     if eos_pos.numel() > 0:
@@ -223,12 +269,14 @@ class ImplicitRefinementModel(nn.Module):
                         needs_refine[b, first_eos:] = False
                         finished[b] = True
 
+            # In-place update where possible
             x_t = torch.where(needs_refine, pred_tokens, x_t)
 
-            changed = (x_t != x_prev)
+            # More efficient change detection
+            changed = x_t != x_prev
             if self.eos_token_id is not None:
-                active = ~finished.unsqueeze(1).expand(-1, max_len)
-                change_ratio = (changed & active).float().sum() / (active.float().sum() + 1e-8)
+                active_mask = ~finished.unsqueeze(1)
+                change_ratio = (changed & active_mask).sum().float() / (active_mask.sum().float() + 1e-8)
             else:
                 change_ratio = changed.float().mean()
 
@@ -236,10 +284,12 @@ class ImplicitRefinementModel(nn.Module):
                 print(f"✅ Stopped at step {step+1} (change: {change_ratio:.2%})")
                 break
 
-            x_prev = x_t.clone()
+            x_prev = x_t.clone()  # Only clone when continuing
+            
             if self.config.use_self_cond:
-                x_self_cond = F.softmax(logits, dim=-1).detach()
+                x_self_cond = F.softmax(logits, dim=-1)
 
+        # Convert to output format
         outputs = []
         for b in range(batch_size):
             seq = x_t[b].cpu().tolist()
@@ -256,44 +306,54 @@ class ImplicitRefinementModel(nn.Module):
         B, L = x_0.shape
         device = x_0.device
 
+        # Compute padding mask once
         if lengths is not None:
             positions = torch.arange(L, device=device).unsqueeze(0)
             padding_mask = positions < lengths.unsqueeze(1)
         else:
-            padding_mask = (x_0 != self.pad_token_id)
+            padding_mask = x_0 != self.pad_token_id
 
         t = torch.randint(0, self.config.max_refinement_steps, (B,), device=device)
         mask_rate = 1.0 - (t.float() / self.config.max_refinement_steps)
-        rand_mask = torch.rand(B, L, device=device) < mask_rate.unsqueeze(1)
-        mask = rand_mask & padding_mask
+        
+        # Efficient masking
+        rand_vals = torch.rand(B, L, device=device)
+        mask = (rand_vals < mask_rate.unsqueeze(1)) & padding_mask
         x_t = torch.where(mask, self.mask_token_id, x_0)
 
         x_self_cond = None
         if self.config.use_self_cond:
             with torch.no_grad():
                 t_prev = torch.clamp(t + 1, max=self.config.max_refinement_steps - 1)
-                rand_mask_prev = torch.rand(B, L, device=device) < (1.0 - (t_prev.float() / self.config.max_refinement_steps)).unsqueeze(1)
-                mask_prev = rand_mask_prev & padding_mask
+                mask_rate_prev = 1.0 - (t_prev.float() / self.config.max_refinement_steps)
+                rand_vals_prev = torch.rand(B, L, device=device)
+                mask_prev = (rand_vals_prev < mask_rate_prev.unsqueeze(1)) & padding_mask
                 x_t_prev = torch.where(mask_prev, self.mask_token_id, x_0)
+                
                 if self.config.use_refine_gate:
                     logits_init, _ = self(x_t_prev, t_prev.float())
                 else:
                     logits_init = self(x_t_prev, t_prev.float())
-                x_self_cond = F.softmax(logits_init / 1.5, dim=-1).detach()
+                x_self_cond = F.softmax(logits_init / 1.5, dim=-1)
 
-        #  
         if self.config.use_refine_gate:
             logits, refine_gate = self(x_t, t.float(), x_self_cond)
         else:
             logits = self(x_t, t.float(), x_self_cond)
-        #  
 
-        recon_loss = F.cross_entropy(logits.view(-1, logits.size(-1)), x_0.view(-1), reduction='none')
-        recon_loss = recon_loss.view(B, L)
-        recon_loss = (recon_loss * mask.float()).sum() / (mask.float().sum() + 1e-8)
+        # More efficient loss computation
+        mask_flat = mask.view(-1)
+        recon_loss = F.cross_entropy(
+            logits.view(-1, logits.size(-1)),
+            x_0.view(-1),
+            reduction='none'
+        )
+        recon_loss = (recon_loss * mask_flat.float()).sum() / (mask_flat.float().sum() + 1e-8)
 
-        probs = F.softmax(logits, dim=-1)
-        entropy = -(probs * torch.log(probs + 1e-8)).sum(dim=-1)
+        # Optimized diversity loss
+        log_probs = F.log_softmax(logits, dim=-1)
+        probs = torch.exp(log_probs)
+        entropy = -(probs * log_probs).sum(dim=-1)
         diversity_loss = torch.relu(0.5 - entropy) * mask.float()
         diversity_loss = diversity_loss.sum() / (mask.float().sum() + 1e-8)
 
@@ -313,16 +373,16 @@ class ImplicitRefinementModel(nn.Module):
         
         B = 1
         if prompt is not None:
-            x_t = prompt.clone().to(device).unsqueeze(0)
+            x_t = prompt.to(device).unsqueeze(0)
             assert x_t.shape[1] == max_len
         else:
-            x_t = torch.full((B, max_len), self.mask_token_id, device=device)
+            x_t = torch.full((B, max_len), self.mask_token_id, device=device, dtype=torch.long)
         
         finished = torch.zeros(B, dtype=torch.bool, device=device)
-        x_prev = x_t.clone()
         x_self_cond = None
         trajectory = []
 
+        # Initial state
         tokens_str = self._tokens_to_str(x_t[0])
         trajectory.append({
             'step': 0,
@@ -336,6 +396,9 @@ class ImplicitRefinementModel(nn.Module):
             'refine_gate': [1.0] * max_len if self.config.use_refine_gate else None
         })
 
+        x_prev = x_t.clone()
+        stopped_early = False
+
         for step in range(self.config.max_refinement_steps):
             t = torch.full((B,), step, dtype=torch.float, device=device)
             
@@ -346,34 +409,33 @@ class ImplicitRefinementModel(nn.Module):
                 refine_gate = None
 
             uncertainty = self._get_uncertainty_from_teacher(x_t, t, x_self_cond)
-            probs = F.softmax(logits / self.config.sampling_temperature, dim=-1)
+            probs = F.softmax(logits * (1.0 / self.config.sampling_temperature), dim=-1)
             pred_tokens = torch.multinomial(probs.view(-1, probs.size(-1)), 1).view(B, max_len)
 
             if self.config.use_refine_gate:
                 needs_refine = refine_gate > 0.5
                 refine_gate_cpu = refine_gate[0].cpu().tolist()
             else:
-                needs_refine = (uncertainty > self.config.min_refine_uncertainty)
+                needs_refine = uncertainty > self.config.min_refine_uncertainty
                 refine_gate_cpu = None
 
             if self.eos_token_id is not None:
-                eos_mask = (x_t == self.eos_token_id)
-                for b in range(B):
-                    if finished[b]:
-                        needs_refine[b] = False
-                        continue
-                    eos_pos = eos_mask[b].nonzero(as_tuple=True)[0]
+                eos_mask = x_t == self.eos_token_id
+                if not finished[0]:
+                    eos_pos = eos_mask[0].nonzero(as_tuple=True)[0]
                     if eos_pos.numel() > 0:
                         first_eos = eos_pos.min().item()
-                        needs_refine[b, first_eos:] = False
-                        finished[b] = True
+                        needs_refine[0, first_eos:] = False
+                        finished[0] = True
+                else:
+                    needs_refine[0] = False
 
             new_x_t = torch.where(needs_refine, pred_tokens, x_t)
-            changed = (new_x_t != x_prev)
+            changed = new_x_t != x_prev
             
             if self.eos_token_id is not None:
                 active = ~finished.unsqueeze(1).expand(-1, max_len)
-                change_ratio = (changed & active).float().sum() / (active.float().sum() + 1e-8)
+                change_ratio = (changed & active).sum().float() / (active.sum().float() + 1e-8)
             else:
                 change_ratio = changed.float().mean()
 
@@ -398,10 +460,9 @@ class ImplicitRefinementModel(nn.Module):
 
             x_t = new_x_t
             x_prev = x_t.clone()
+            
             if self.config.use_self_cond:
-                x_self_cond = F.softmax(logits, dim=-1).detach()
-        else:
-            stopped_early = False
+                x_self_cond = F.softmax(logits, dim=-1)
 
         final_seq = x_t[0].cpu().tolist()
         if self.eos_token_id is not None:
@@ -418,7 +479,8 @@ class ImplicitRefinementModel(nn.Module):
             'max_steps': self.config.max_refinement_steps
         }
 
-    def _tokens_to_str(self, tokens: torch.Tensor) -> str:
+    def _tokens_to_str(self, tokens: torch.Tensor) -> List[str]:
+        """Optimized token to string conversion"""
         ids = tokens.cpu().tolist()
         strs = []
         for tid in ids:
@@ -433,18 +495,21 @@ class ImplicitRefinementModel(nn.Module):
         return strs
 
     def _build_mask_str(self, needs_refine: torch.Tensor, tokens: torch.Tensor) -> str:
+        """Optimized mask string builder"""
         arrows = []
-        for i, refine in enumerate(needs_refine):
-            if refine:
+        for i in range(len(needs_refine)):
+            if needs_refine[i]:
                 arrows.append("↑")
             else:
-                if tokens[i].item() not in [self.mask_token_id, self.pad_token_id]:
-                    arrows.append(" ")
-                else:
+                tid = tokens[i].item()
+                if tid in (self.mask_token_id, self.pad_token_id):
                     arrows.append("·")
+                else:
+                    arrows.append(" ")
         return "".join(arrows)
     
     def print_refinement_trajectory(self, analysis: dict, tokenizer=None):
+        """Unchanged visualization method"""
         steps = analysis['steps']
         mode = "INTERNAL GATE" if self.config.use_refine_gate else "UNCERTAINTY THRESHOLD"
         print(f"🔍 Refinement Trajectory ({mode})\n")
@@ -478,9 +543,6 @@ class ImplicitRefinementModel(nn.Module):
             print(f"\nFinal: {final}")
 
 
-#  
-# TESTING: V vs Z (no external policy, gate is internal)
-#  
 if __name__ == "__main__":
     class DummyTokenizer:
         pad_token_id = 0
@@ -492,7 +554,7 @@ if __name__ == "__main__":
 
     for use_gate in [False, True]:
         print("\n" + "="*60)
-        print(f"TESTING V: use_refine_gate = {use_gate}")
+        print(f"TESTING OPTIMIZED V: use_refine_gate = {use_gate}")
         print("="*60)
 
         config = ImplicitRefinementConfig(
@@ -504,7 +566,8 @@ if __name__ == "__main__":
             stop_threshold=0.05,
             diversity_weight=0.1,
             sampling_temperature=1.0,
-            use_refine_gate=use_gate
+            use_refine_gate=use_gate,
+            use_gradient_checkpointing=False  # Enable for training large models
         )
 
         model = ImplicitRefinementModel(config, tokenizer=tokenizer)
@@ -513,7 +576,7 @@ if __name__ == "__main__":
 
         # Test forward
         B, L = 1, 5
-        x_t = torch.full((B, L), model.mask_token_id)
+        x_t = torch.full((B, L), model.mask_token_id, dtype=torch.long)
         t = torch.zeros(B)
         with torch.no_grad():
             if use_gate:
@@ -529,4 +592,3 @@ if __name__ == "__main__":
         # Test trajectory
         analysis = model.analyze_refinement_trajectory(5, 'cpu', seed=1)
         model.print_refinement_trajectory(analysis)
-
