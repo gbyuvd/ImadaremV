@@ -99,9 +99,8 @@ config = ImplicitRefinementConfig(
             use_refine_gate=use_gate
         )
 
-        model = ImplicitRefinementModel(config, tokenizer=tokenizer)
-        model.eval()
-        model.init_teacher()
+model = ImplicitRefinementModel(config, tokenizer=tokenizer)
+model.init_teacher()
 ```
 
 
