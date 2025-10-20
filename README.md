@@ -115,6 +115,7 @@ config = ImplicitRefinementConfig(
 - Compatible with **any subword or character tokenizer**  
 
 ❌ **Cons**  
+- Still work in progress and evaluation
 - Output length capped by `max_seq_len`  
 - No explicit mechanism for **long-range coverage** or **input conditioning** (e.g., prompts)  
 
